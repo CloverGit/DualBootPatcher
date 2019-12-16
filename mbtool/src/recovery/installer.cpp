@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2018  Andrew Gunnerson <andrewgunnerson@gmail.com>
+ * Copyright (C) 2014-2019  Andrew Gunnerson <andrewgunnerson@gmail.com>
  *
  * This file is part of DualBootPatcher
  *
@@ -71,9 +71,12 @@
 // Local
 #include "recovery/image.h"
 #include "recovery/installer_util.h"
+#include "util/android_api.h"
+#include "util/legacy_property_service.h"
 #include "util/multiboot.h"
 #include "util/signature.h"
 #include "util/romconfig.h"
+#include "util/property_service.h"
 #include "util/switcher.h"
 #include "util/wipe.h"
 
@@ -125,6 +128,12 @@ Installer::Installer(std::string zip_file, std::string chroot_dir,
     _passthrough = _output_fd >= 0;
 
     LOGD("Initialized installer for zip file: %s", _zip_file.c_str());
+
+    if (char *prop_env = getenv("ANDROID_PROPERTY_WORKSPACE")) {
+        LOGD("Recovery sets ANDROID_PROPERTY_WORKSPACE='%s'", prop_env);
+    } else {
+        LOGD("Recovery does not set ANDROID_PROPERTY_WORKSPACE");
+    }
 }
 
 Installer::~Installer()
@@ -211,6 +220,17 @@ static bool log_copy_dir(const std::string &source,
     if (auto r = util::copy_dir(source, target, flags); !r) {
         LOGE("Failed to copy contents of %s/ to %s/: %s",
              source.c_str(), target.c_str(), r.error().message().c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool log_file_write_string(const std::string &path,
+                                  std::string_view contents)
+{
+    if (auto r = util::file_write_string(path, contents); !r) {
+        LOGE("Failed to write %s: %s",
+             path.c_str(), r.error().message().c_str());
         return false;
     }
     return true;
@@ -323,6 +343,7 @@ bool Installer::create_chroot()
     if (log_mount("none", in_chroot("/dev").c_str(), "tmpfs", 0, "") < 0
             || log_mkdir(in_chroot("/dev/pts").c_str(), 0755) < 0
             || log_mount("none", in_chroot("/dev/pts").c_str(), "devpts", 0, "") < 0
+            || log_mkdir(in_chroot("/dev/socket").c_str(), 0755) < 0
             || log_mount("none", in_chroot("/proc").c_str(), "proc", 0, "") < 0
             || log_mount("none", in_chroot("/sys").c_str(), "sysfs", 0, "") < 0
             || log_mount("none", in_chroot("/tmp").c_str(), "tmpfs", 0, "") < 0) {
@@ -618,6 +639,28 @@ bool Installer::extract_multiboot_files()
         }
     }
 
+    std::string updater(_temp);
+    updater += "/updater";
+
+    // Check if install is using AROMA
+    if (auto r = is_aroma(updater)) {
+        _use_aroma = r.value();
+    } else {
+        LOGW("%s: Failed to determine if updater is AROMA: %s",
+             updater.c_str(), r.error().message().c_str());
+        _use_aroma = false;
+    }
+    LOGD("update-binary is AROMA: %d", _use_aroma);
+
+    // Check if legacy props are required
+    if (auto r = is_legacy_props(updater)) {
+        _use_legacy_props = r.value();
+    } else {
+        LOGE("%s: Failed to determine if using legacy props: %s",
+             updater.c_str(), r.error().message().c_str());
+        return false;
+    }
+
     return true;
 }
 
@@ -845,20 +888,23 @@ bool Installer::change_root(const std::string &path)
 
 bool Installer::set_up_legacy_properties()
 {
-    // We don't need to worry about /dev/__properties__ since that's not present
-    // in the chroot. Bionic will automatically fall back to getting the fd from
-    // the ANDROID_PROPERTY_WORKSPACE environment variable.
+    LegacyPropertyService svc;
 
-    if (!_legacy_prop_svc.initialize()) {
+    if (!svc.initialize()) {
         LOGE("Failed to initialize legacy property service");
         return false;
     }
 
     for (auto const &pair : _chroot_prop) {
-        _legacy_prop_svc.set(pair.first, pair.second);
+        LOGD("Setting legacy property '%s'='%s'",
+             pair.first.c_str(), pair.second.c_str());
+        if (!svc.set(pair.first, pair.second)) {
+            LOGW("Failed to set legacy property '%s'='%s'",
+                 pair.first.c_str(), pair.second.c_str());
+        }
     }
 
-    auto [fd, size] = _legacy_prop_svc.workspace();
+    auto [fd, size] = svc.workspace();
     char tmp[32];
 
     snprintf(tmp, sizeof(tmp), "%d,%zu", dup(fd), size);
@@ -872,6 +918,50 @@ bool Installer::set_up_legacy_properties()
     LOGD("Switched to legacy properties environment: %s", tmp);
 
     return true;
+}
+
+bool Installer::set_up_modern_properties()
+{
+    PropertyService svc;
+
+    if (!svc.initialize()) {
+        LOGE("Failed to initialize property service");
+        return false;
+    }
+
+    if (!svc.start_thread()) {
+        LOGE("Failed to start property service thread");
+        return false;
+    }
+
+    for (auto const &pair : _chroot_prop) {
+        LOGD("Setting modern property '%s'='%s'",
+             pair.first.c_str(), pair.second.c_str());
+        if (!svc.set(pair.first, pair.second)) {
+            LOGW("Failed to set modern property '%s'='%s'",
+                 pair.first.c_str(), pair.second.c_str());
+        }
+    }
+
+    if (!svc.stop_thread()) {
+        LOGE("Failed to stop property service thread");
+        return false;
+    }
+
+    LOGD("Successfully initialized modern properties");
+
+    return true;
+}
+
+bool Installer::set_up_properties()
+{
+    LOGV("updater requires legacy properties: %d", _use_legacy_props);
+
+    log_delete_recursive("/dev/__properties__");
+
+    return _use_legacy_props
+            ? set_up_legacy_properties()
+            : set_up_modern_properties();
 }
 
 bool Installer::updater_fd_reader(int stdio_fd, int command_fd)
@@ -981,15 +1071,12 @@ bool Installer::run_real_updater()
 
     pid_t parent = getppid();
 
-    bool aroma = is_aroma(chroot_updater);
-    LOGD("update-binary is AROMA: %d", aroma);
-
-    if (aroma) {
+    if (_use_aroma) {
         kill(parent, SIGSTOP);
     }
 
     auto resume_aroma = finally([&]{
-        if (aroma) {
+        if (_use_aroma) {
             kill(parent, SIGCONT);
         }
     });
@@ -1052,15 +1139,7 @@ bool Installer::run_real_updater()
                 close(stdio_fds[1]);
             }
 
-            if (auto r = util::file_find_one_of(
-                    "/mb/updater", {"ANDROID_PROPERTY_WORKSPACE"})) {
-                LOGV("updater requires legacy properties: %d", r.value());
-
-                if (r.value() && !set_up_legacy_properties()) {
-                    _exit(EXIT_FAILURE);
-                }
-            } else {
-                LOGE("Failed to read updater: %s", r.error().message().c_str());
+            if (!set_up_properties()) {
                 _exit(EXIT_FAILURE);
             }
 
@@ -1143,7 +1222,7 @@ bool Installer::run_debug_shell()
                 _exit(EXIT_FAILURE);
             }
 
-            if (!set_up_legacy_properties()) {
+            if (!set_up_properties()) {
                 _exit(EXIT_FAILURE);
             }
 
@@ -1167,9 +1246,9 @@ bool Installer::run_debug_shell()
 #endif
 }
 
-bool Installer::is_aroma(const std::string &path)
+oc::result<bool> Installer::is_aroma(const std::string &path)
 {
-    auto r = util::file_find_one_of(path, {
+    return util::file_find_one_of(path, {
         "AROMA Installer",
         "support@amarullz.com",
         "(c) 2013 by amarullz xda-developers",
@@ -1179,7 +1258,13 @@ bool Installer::is_aroma(const std::string &path)
         "AROMA_BUILD",
         "AROMA_VERSION"
     });
-    return r && r.value();
+}
+
+oc::result<bool> Installer::is_legacy_props(const std::string &path)
+{
+    return util::file_find_one_of(path, {
+        "ANDROID_PROPERTY_WORKSPACE",
+    });
 }
 
 
@@ -1624,6 +1709,12 @@ Installer::ProceedState Installer::install_stage_set_up_chroot()
                            util::CopyFlag::CopyAttributes
                          | util::CopyFlag::CopyXattrs);
 
+    // Forge property_contexts
+    static const std::string_view prop_contexts = "* u:object_r:default_prop:s0\n";
+    if (!log_file_write_string(in_chroot("/property_contexts"), prop_contexts)) {
+        return ProceedState::Fail;
+    }
+
     return on_set_up_chroot();
 }
 
@@ -1745,6 +1836,17 @@ Installer::ProceedState Installer::install_stage_installation()
     // Get chroot props
     _chroot_prop = get_properties();
 
+    // Check if legacy props are required
+    std::string updater(_temp);
+    updater += "/updater";
+    if (auto r = is_legacy_props(updater)) {
+        _use_legacy_props = r.value();
+    } else {
+        LOGE("%s: Failed to determine if using legacy props: %s",
+             updater.c_str(), r.error().message().c_str());
+        return ProceedState::Fail;
+    }
+
     // Run real update-binary
     display_msg("Running real update-binary");
     display_msg("Here we go!");
@@ -1793,8 +1895,7 @@ Installer::ProceedState Installer::install_stage_installation()
     run_command_chroot(_chroot, { HELPER_TOOL, "mount", "/system" });
 
     // Grab version and display ID so that can be cached in config.json later
-    if (auto props = util::property_file_get_all(
-            in_chroot("/system/build.prop"))) {
+    if (auto props = util::property_file_get_all(in_chroot(BUILD_PROP_PATH))) {
         auto to_cache = {
             "ro.build.version.release",
             "ro.build.display.id",

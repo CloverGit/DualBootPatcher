@@ -27,17 +27,17 @@ set_source_files_properties(
 )
 
 set_source_files_properties(
-    src/boot/property_service.cpp
-    PROPERTIES
-    COMPILE_FLAGS
-    "-Wno-gnu-statement-expression -Wno-shorten-64-to-32 -Wno-sign-conversion"
-)
-
-set_source_files_properties(
     src/util/legacy_property_service.cpp
     PROPERTIES
     COMPILE_FLAGS
     "-Wno-shorten-64-to-32 -Wno-sign-conversion"
+)
+
+set_source_files_properties(
+    src/util/property_service.cpp
+    PROPERTIES
+    COMPILE_FLAGS
+    "-Wno-gnu-statement-expression -Wno-shorten-64-to-32 -Wno-sign-conversion"
 )
 
 set_source_files_properties(
@@ -64,8 +64,10 @@ if(${MBP_BUILD_TARGET} STREQUAL android-system)
     add_library(
         mbtool-util
         STATIC
+        src/util/android_api.cpp
         src/util/legacy_property_service.cpp
         src/util/multiboot.cpp
+        src/util/property_service.cpp
         src/util/romconfig.cpp
         src/util/roms.cpp
         src/util/sepolpatch.cpp
@@ -91,7 +93,6 @@ if(${MBP_BUILD_TARGET} STREQUAL android-system)
         src/boot/mount_fstab.cpp
         src/boot/packages.cpp
         src/boot/properties.cpp
-        src/boot/property_service.cpp
         src/boot/reboot.cpp
         src/boot/uevent_dump.cpp
         src/boot/uevent_thread.cpp
@@ -164,7 +165,6 @@ if(${MBP_BUILD_TARGET} STREQUAL android-system)
         mbtool-util
         mbbootimg-static
         libminizip
-        Procps::Procps
     )
     target_link_libraries(
         mbtool_recovery
@@ -174,7 +174,6 @@ if(${MBP_BUILD_TARGET} STREQUAL android-system)
         mbbootimg-static
         libminizip
         LibArchive::LibArchive
-        Procps::Procps # TODO
     )
 
     install(

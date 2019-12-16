@@ -53,7 +53,7 @@ if(${MBP_BUILD_TARGET} STREQUAL android-app
     # file will work with newer versions of the NDK, we'll depend on an exact
     # version.
     set(ndk_version_whitelist
-        r17.0.4754217
+        r18.1.5063045
     )
 
     if(NOT ANDROID_NDK_RELEASE IN_LIST ndk_version_whitelist)
@@ -70,13 +70,6 @@ if(MBP_CI_VERSION)
         message(FATAL_ERROR "Cannot override version number for non-CI builds")
     endif()
     set(MBP_VERSION ${MBP_CI_VERSION})
-endif()
-
-# Tests
-set(MBP_ENABLE_TESTS TRUE CACHE BOOL "Enable building of tests")
-
-if(MBP_ENABLE_TESTS)
-    enable_testing()
 endif()
 
 # CPack versions
@@ -168,11 +161,17 @@ include(cmake/VariableBackup.cmake)
 # Compile and link flags
 include(cmake/CompilerFlags.cmake)
 
+# Tests
+include(cmake/Testing.cmake)
+
 # Third party binaries
 add_subdirectory(thirdparty)
 
 # Dependencies
 include(cmake/Dependencies.cmake)
+
+# QEMU-based testing
+include(cmake/Qemu.cmake)
 
 add_subdirectory(hosttools)
 add_subdirectory(libmbcommon)
@@ -183,6 +182,7 @@ add_subdirectory(libmbpio)
 add_subdirectory(libmbpatcher)
 add_subdirectory(libmbsign)
 add_subdirectory(libmbsparse)
+add_subdirectory(libmbsystrace)
 add_subdirectory(libmbutil)
 add_subdirectory(data)
 add_subdirectory(mbtool)

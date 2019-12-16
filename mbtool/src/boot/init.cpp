@@ -64,9 +64,10 @@
 #include "boot/daemon.h"
 #include "boot/emergency.h"
 #include "boot/mount_fstab.h"
-#include "boot/property_service.h"
 #include "boot/uevent_thread.h"
+#include "util/android_api.h"
 #include "util/multiboot.h"
+#include "util/property_service.h"
 #include "util/romconfig.h"
 #include "util/sepolpatch.h"
 #include "util/signature.h"
@@ -338,7 +339,8 @@ static bool fix_file_contexts(const char *path)
     });
 
     while ((read = getline(&line, &len, fp_old.get())) >= 0) {
-        if (starts_with(line, "/data/media(") && !strstr(line, "<<none>>")) {
+        if (starts_with(line, INTERNAL_STORAGE_ROOT "(")
+                && !strstr(line, "<<none>>")) {
             fputc('#', fp_new.get());
         }
 
@@ -352,12 +354,12 @@ static bool fix_file_contexts(const char *path)
 
     static const char *new_contexts =
             "\n"
-            "/data/media              <<none>>\n"
-            "/data/media/[0-9]+(/.*)? <<none>>\n"
-            "/raw(/.*)?               <<none>>\n"
-            "/data/multiboot(/.*)?    <<none>>\n"
-            "/cache/multiboot(/.*)?   <<none>>\n"
-            "/system/multiboot(/.*)?  <<none>>\n";
+            INTERNAL_STORAGE_ROOT                 " <<none>>\n"
+            INTERNAL_STORAGE_ROOT "/[0-9]+(/.*)?" " <<none>>\n"
+            "/raw(/.*)?"                          " <<none>>\n"
+            "/data/multiboot(/.*)?"               " <<none>>\n"
+            "/cache/multiboot(/.*)?"              " <<none>>\n"
+            "/system/multiboot(/.*)?"             " <<none>>\n";
     fputs(new_contexts, fp_new.get());
 
     return replace_file(path, new_path.c_str());
@@ -797,12 +799,6 @@ static std::string find_fstab()
     return std::string();
 }
 
-static unsigned long get_api_version()
-{
-    return util::property_file_get_num<unsigned long>(
-            "/system/build.prop", "ro.build.version.sdk", 0);
-}
-
 static bool create_layout_version()
 {
     // Prevent installd from dying because it can't unmount /data/media for
@@ -811,7 +807,7 @@ static bool create_layout_version()
     ScopedFILE fp(fopen("/data/.layout_version", "wbe"), fclose);
     if (fp) {
         const char *layout_version;
-        if (get_api_version() >= 21) {
+        if (get_sdk_version(SdkVersionSource::BuildProp) >= 21) {
             layout_version = "3";
         } else {
             layout_version = "2";
@@ -864,7 +860,7 @@ static bool disable_spota()
 {
     static const char *spota_dir = "/data/security/spota";
 
-    auto props = util::property_file_get_all("/system/build.prop");
+    auto props = util::property_file_get_all(BUILD_PROP_PATH);
 
     if (props && strcasecmp((*props)["ro.product.brand"].c_str(), "samsung") != 0
             && strcasecmp((*props)["ro.product.manufacturer"].c_str(), "samsung") != 0) {
@@ -1096,11 +1092,6 @@ static void redirect_stdio_null()
     }
 }
 
-static bool critical_failure()
-{
-    return emergency_reboot();
-}
-
 int init_main(int argc, char *argv[])
 {
     // Some devices actually receive arguments, so ignore them during boot
@@ -1167,8 +1158,7 @@ int init_main(int argc, char *argv[])
     if (!contents) {
         LOGE("%s: Failed to read file: %s", DEVICE_JSON_PATH,
              contents.error().message().c_str());
-        critical_failure();
-        return EXIT_FAILURE;
+        emergency_reboot();
     }
 
     // Start probing for devices so we have somewhere to write logs for
@@ -1181,12 +1171,10 @@ int init_main(int argc, char *argv[])
 
     if (!device_from_json(contents.value(), device, error)) {
         LOGE("%s: Failed to load device definition", DEVICE_JSON_PATH);
-        critical_failure();
-        return EXIT_FAILURE;
+        emergency_reboot();
     } else if (device.validate()) {
         LOGE("%s: Device definition validation failed", DEVICE_JSON_PATH);
-        critical_failure();
-        return EXIT_FAILURE;
+        emergency_reboot();
     }
 
     // Symlink by-name directory to /dev/block/by-name (ugh... ASUS)
@@ -1213,8 +1201,7 @@ int init_main(int argc, char *argv[])
     std::shared_ptr<Rom> rom = Roms::create_rom(rom_id);
     if (!rom) {
         LOGE("Unknown ROM ID: %s", rom_id.c_str());
-        critical_failure();
-        return EXIT_FAILURE;
+        emergency_reboot();
     }
 
     LOGV("ROM ID is: %s", rom_id.c_str());
@@ -1229,8 +1216,7 @@ int init_main(int argc, char *argv[])
     if (!mount_fstab(fstab.c_str(), rom, device, flags,
                      uevent_thread.device_handler())) {
         LOGE("Failed to mount fstab");
-        critical_failure();
-        return EXIT_FAILURE;
+        emergency_reboot();
     }
 
     LOGV("Successfully mounted fstab");
@@ -1249,8 +1235,7 @@ int init_main(int argc, char *argv[])
     // Mount ROM (bind mount directory or mount images, etc.)
     if (!mount_rom(rom)) {
         LOGE("Failed to mount ROM directories and images");
-        critical_failure();
-        return EXIT_FAILURE;
+        emergency_reboot();
     }
 
     std::string config_path(rom->config_path());
@@ -1292,8 +1277,7 @@ int init_main(int argc, char *argv[])
                             SELinuxPatch::Main)) {
             LOGW("%s: Failed to patch policy",
                  util::SELINUX_DEFAULT_POLICY_FILE);
-            critical_failure();
-            return EXIT_FAILURE;
+            emergency_reboot();
         }
     }
 
@@ -1330,8 +1314,7 @@ int init_main(int argc, char *argv[])
     LOGD("Launching real init ...");
     execlp("/init", "/init", nullptr);
     LOGE("Failed to exec real init: %s", strerror(errno));
-    critical_failure();
-    return EXIT_FAILURE;
+    emergency_reboot();
 }
 
 }

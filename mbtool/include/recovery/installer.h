@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2018  Andrew Gunnerson <andrewgunnerson@gmail.com>
+ * Copyright (C) 2014-2019  Andrew Gunnerson <andrewgunnerson@gmail.com>
  *
  * This file is part of DualBootPatcher
  *
@@ -26,9 +26,9 @@
 
 #include "mbcommon/common.h"
 #include "mbcommon/flags.h"
+#include "mbcommon/outcome.h"
 #include "mbdevice/device.h"
 
-#include "util/legacy_property_service.h"
 #include "util/roms.h"
 
 namespace mb
@@ -102,7 +102,8 @@ protected:
     std::unordered_map<std::string, std::string> _chroot_prop;
     std::unordered_map<std::string, std::string> _cached_prop;
 
-    LegacyPropertyService _legacy_prop_svc;
+    bool _use_aroma;
+    bool _use_legacy_props;
 
     std::string _temp_image_path;
     bool _has_block_image;
@@ -114,11 +115,12 @@ protected:
 
     std::string in_chroot(const std::string &path) const;
 
-    static bool is_aroma(const std::string &path);
-
 
 private:
     bool _ran;
+
+    static oc::result<bool> is_aroma(const std::string &path);
+    static oc::result<bool> is_legacy_props(const std::string &path);
 
     void output_cb(std::string_view line, bool error);
     int run_command(const std::vector<std::string> &argv);
@@ -141,6 +143,8 @@ private:
                             uint64_t image_size);
     static bool change_root(const std::string &path);
     bool set_up_legacy_properties();
+    bool set_up_modern_properties();
+    bool set_up_properties();
     bool updater_fd_reader(int stdio_fd, int command_fd);
     bool run_real_updater();
     bool run_debug_shell();

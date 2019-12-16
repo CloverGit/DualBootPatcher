@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-FROM registry.fedoraproject.org/fedora:28
+FROM registry.fedoraproject.org/fedora:29
 
 # Install gosu
 ENV GOSU_VERSION 1.10
@@ -45,8 +45,8 @@ RUN dnf -y install gnupg \
     && dnf clean all
 
 # Install Android NDK
-ARG ANDROID_NDK_VERSION=r17
-ARG ANDROID_NDK_CHECKSUM=1d886a64483adf3f3a3e3aaf7ac5084184006ac7
+ARG ANDROID_NDK_VERSION=r18b
+ARG ANDROID_NDK_CHECKSUM=500679655da3a86aecf67007e8ab230ea9b4dd7b
 ENV ANDROID_NDK_HOME /opt/android-ndk
 ENV ANDROID_NDK ${ANDROID_NDK_HOME}
 
@@ -72,10 +72,12 @@ RUN dnf -y install \
         ncurses-compat-libs \
         java-1.8.0-openjdk-headless transifex-client \
         openssl-devel yaml-cpp-devel \
+        qemu-system-aarch64-core qemu-system-arm-core qemu-system-x86-core \
     && dnf clean all
 
 # Volumes
 ENV BUILDER_HOME /builder
+RUN mkdir -m 0700 ${BUILDER_HOME}
 WORKDIR ${BUILDER_HOME}
 
 # Entrypoint

@@ -45,6 +45,7 @@
 #include "mblog/logging.h"
 #include "mbutil/selinux.h"
 
+#include "util/android_api.h"
 #include "util/multiboot.h"
 
 #define LOG_TAG "mbtool/util/sepolpatch"
@@ -270,21 +271,56 @@ SELinuxResult selinux_raw_set_attribute(policydb_t *pdb,
         changed = true;
     }
 
-    // Update MLS constraints
-
-    // Constraints are applied per class
-    // See constraint_expr_to_string() in libsepol/src/module_to_cil.c
-    for (uint32_t class_val = 1; class_val <= pdb->p_classes.nprim;
-            ++class_val) {
+    // As of 5.0-rc6, the kernel doesn't use expr->type_names in
+    // constraint_expr_eval(), even if pdb->policyvers >=
+    // POLICYDB_VERSION_CONSTRAINT_NAMES. This loop will check every constraint
+    // and toggle the bit corresponding to `type_val` in expr->names if the bit
+    // corresponding to `attr_val` is toggled in expr->type_names->types. Note
+    // that this only works if the source policy version is new enough. Older
+    // policies do not retain attribute information in the constraints.
+    for (uint32_t class_val = 1; class_val <= pdb->p_classes.nprim; ++class_val) {
         class_datum_t *clazz = pdb->class_val_to_struct[class_val - 1];
 
-        for (constraint_node_t *node = clazz->constraints; node;
-                node = node->next) {
-            for (constraint_expr_t *expr = node->expr; expr;
-                    expr = expr->next) {
-                if (expr->expr_type == CEXPR_NAMES && ebitmap_get_bit(
-                        &expr->type_names->types, attr_val - 1)) {
+        for (constraint_node_t *node = clazz->constraints; node; node = node->next) {
+            for (constraint_expr_t *expr = node->expr; expr; expr = expr->next) {
+                if (expr->expr_type == CEXPR_NAMES && expr->attr & CEXPR_TYPE
+                        && ebitmap_get_bit(&expr->type_names->types, attr_val - 1)) {
                     if (ebitmap_set_bit(&expr->names, type_val - 1, 1) < 0) {
+                        return SELinuxResult::Error;
+                    }
+
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    return changed ? SELinuxResult::Changed : SELinuxResult::Unchanged;
+}
+
+/*!
+ * \brief Copy constraints that affect one type to affect another type
+ *
+ * \param pdb Policy object
+ * \param source_type_val Value of source type (NOT attribute)
+ * \param target_type_val Value of target type (NOT attribute)
+ *
+ * \return Whether any constraint was updated
+ */
+SELinuxResult selinux_raw_copy_constraints(policydb_t *pdb,
+                                           uint16_t source_type_val,
+                                           uint16_t target_type_val)
+{
+    bool changed = false;
+
+    for (uint32_t class_val = 1; class_val <= pdb->p_classes.nprim; ++class_val) {
+        class_datum_t *clazz = pdb->class_val_to_struct[class_val - 1];
+
+        for (constraint_node_t *node = clazz->constraints; node; node = node->next) {
+            for (constraint_expr_t *expr = node->expr; expr; expr = expr->next) {
+                if (expr->expr_type == CEXPR_NAMES && expr->attr & CEXPR_TYPE
+                        && ebitmap_get_bit(&expr->names, source_type_val - 1)) {
+                    if (ebitmap_set_bit(&expr->names, target_type_val - 1, 1) < 0) {
                         return SELinuxResult::Error;
                     }
 
@@ -887,6 +923,93 @@ static bool apply_pre_boot_patches(policydb_t *pdb)
     return true;
 }
 
+static bool copy_attributes(policydb_t *pdb,
+                            const char *source_type,
+                            const char *target_type)
+{
+    if (strcmp(source_type, target_type) == 0) {
+        LOGE("Source and target types are the same: %s", source_type);
+        return false;
+    }
+
+    auto source = find_type(pdb, source_type);
+    if (!source) {
+        LOGE("Source type %s does not exist", source_type);
+        return false;
+    }
+
+    auto target = find_type(pdb, target_type);
+    if (!target) {
+        LOGE("Target type %s does not exist", target_type);
+        return false;
+    }
+
+    std::vector<uint16_t> attributes;
+    ebitmap_node *n;
+    unsigned int bit;
+
+    ebitmap_for_each_bit(&pdb->type_attr_map[source->s.value - 1], n, bit) {
+        if (!ebitmap_node_get_bit(n, bit)) {
+            continue;
+        }
+
+        if (source->s.value != bit + 1) {
+            attributes.push_back(static_cast<uint16_t>(bit + 1));
+        }
+    }
+
+    for (auto const &attr : attributes) {
+        auto ret = selinux_raw_set_attribute(
+                pdb, static_cast<uint16_t>(target->s.value), attr);
+        if (ret == SELinuxResult::Error) {
+            LOGE("Failed to set attribute %s for type %s",
+                 pdb->p_type_val_to_name[attr - 1],
+                 pdb->p_type_val_to_name[target->s.value - 1]);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool copy_constraints(policydb_t *pdb,
+                             const char *source_type,
+                             const char *target_type)
+{
+    if (strcmp(source_type, target_type) == 0) {
+        LOGE("Source and target types are the same: %s", source_type);
+        return false;
+    }
+
+    auto source = find_type(pdb, source_type);
+    if (!source) {
+        LOGE("Source type %s does not exist", source_type);
+        return false;
+    }
+
+    auto target = find_type(pdb, target_type);
+    if (!target) {
+        LOGE("Target type %s does not exist", target_type);
+        return false;
+    }
+
+    auto ret = selinux_raw_copy_constraints(
+            pdb, static_cast<uint16_t>(source->s.value),
+            static_cast<uint16_t>(target->s.value));
+    switch (ret) {
+    case SELinuxResult::Changed:
+    case SELinuxResult::Unchanged:
+        break;
+    case SELinuxResult::Error:
+        LOGE("Failed to copy constraints for: %s -> %s",
+             pdb->p_type_val_to_name[source->s.value - 1],
+             pdb->p_type_val_to_name[target->s.value - 1]);
+        return false;
+    }
+
+    return true;
+}
+
 static bool copy_avtab_rules(policydb_t *pdb,
                              const char *source_type,
                              const char *target_type)
@@ -953,46 +1076,59 @@ static bool copy_avtab_rules(policydb_t *pdb,
  */
 static bool fix_data_media_rules(policydb_t *pdb)
 {
-    static const char *expected_type = "media_rw_data_file";
-    const char *path = INTERNAL_STORAGE;
+    auto sdk_version = get_sdk_version(SdkVersionSource::BuildProp);
+    const char *expected_type;
+
+    if (sdk_version >= 21) {
+        expected_type = "media_rw_data_file";
+    } else {
+        expected_type = "media_data_file";
+    }
+
+    LOGV("Expected SELinux type (API %lu) for %s: %s",
+         sdk_version, INTERNAL_STORAGE_ROOT, expected_type);
 
     if (!find_type(pdb, expected_type)) {
         LOGW("Type %s doesn't exist. Won't touch %s related rules",
-             expected_type, INTERNAL_STORAGE);
+             expected_type, INTERNAL_STORAGE_ROOT);
         return true;
     }
 
-    auto context = util::selinux_lget_context(path);
+    auto context = util::selinux_lget_context(INTERNAL_STORAGE_ROOT);
     if (!context) {
         LOGE("%s: Failed to get context: %s",
-             path, context.error().message().c_str());
-        path = "/data/media";
-        context = util::selinux_lget_context(path);
-        if (!context) {
-            LOGE("%s: Failed to get context: %s",
-                 path, context.error().message().c_str());
-            // Don't fail if /data/media does not exist
-            return errno == ENOENT;
-        }
+             INTERNAL_STORAGE_ROOT, context.error().message().c_str());
+        // Don't fail if /data/media does not exist
+        return errno == ENOENT;
     }
+
+    LOGV("Context of %s: %s", INTERNAL_STORAGE_ROOT, context.value().c_str());
 
     std::vector<std::string> pieces = split(context.value(), ':');
     if (pieces.size() < 3) {
-        LOGE("%s: Malformed context string: %s", path, context.value().c_str());
+        LOGE("%s: Malformed context string: %s",
+             INTERNAL_STORAGE_ROOT, context.value().c_str());
         return false;
     }
     const std::string &type = pieces[2];
 
-    if (type == expected_type) {
-        return true;
+    LOGV("Type of %s: %s", INTERNAL_STORAGE_ROOT, type.c_str());
+
+    if (type != expected_type) {
+        if (!find_type(pdb, type.c_str())) {
+            LOGV("Type %s does not exist. Creating it", type.c_str());
+            ff(selinux_create_type(pdb, type.c_str()) != SELinuxResult::Error);
+        }
+
+        LOGV("Copying %s attributes to %s", expected_type, type.c_str());
+        ff(copy_attributes(pdb, expected_type, type.c_str()));
+
+        LOGV("Copying %s constraints to %s", expected_type, type.c_str());
+        ff(copy_constraints(pdb, expected_type, type.c_str()));
+
+        LOGV("Copying %s avtab rules to %s", expected_type, type.c_str());
+        ff(copy_avtab_rules(pdb, expected_type, type.c_str()));
     }
-
-    LOGV("Copying %s rules to %s because of improper %s SELinux label",
-         expected_type, type.c_str(), path);
-    ff(copy_avtab_rules(pdb, expected_type, type.c_str()));
-
-    // Required for MLS on Android 7.1
-    ff(selinux_set_attribute(pdb, type.c_str(), "mlstrustedobject"));
 
     return true;
 }
@@ -1044,8 +1180,10 @@ static bool create_mbtool_types(policydb_t *pdb)
     ff(add_rules(pdb, "zygote", "init", "fifo_file", { "write" }));
 
     // Allow 'am' to use fds (eg. pipes) inherited from the daemon
-    ff(add_rules(pdb, "system_server", "mb_exec", "fd", { "use" }));
-    ff(add_rules(pdb, "system_server", "mb_exec", "fifo_file", { "write" }));
+    if (find_type(pdb, "system_server")) {
+        ff(add_rules(pdb, "system_server", "mb_exec", "fd", { "use" }));
+        ff(add_rules(pdb, "system_server", "mb_exec", "fifo_file", { "write" }));
+    }
 
     // Allow rebooting via the android.intent.action.REBOOT intent
     if (find_type(pdb, "activity_service")) {
@@ -1079,18 +1217,16 @@ static bool create_mbtool_types(policydb_t *pdb)
     }
 
     // For all attributes
-    for (uint32_t type_val = 1; type_val <= pdb->p_types.nprim;
-            ++type_val) {
+    for (uint32_t type_val = 1; type_val <= pdb->p_types.nprim; ++type_val) {
         // Skip non-attributes
-        if (pdb->type_val_to_struct[type_val - 1]->flavor
-                != TYPE_ATTRIB) {
+        if (pdb->type_val_to_struct[type_val - 1]->flavor != TYPE_ATTRIB) {
             continue;
         }
 
-        auto ret2 = selinux_raw_grant_all_perms(
+        auto ret = selinux_raw_grant_all_perms(
                 pdb, static_cast<uint16_t>(mb_exec->s.value),
                 static_cast<uint16_t>(type_val));
-        switch (ret2) {
+        switch (ret) {
         case SELinuxResult::Changed:
         case SELinuxResult::Unchanged:
             break;
